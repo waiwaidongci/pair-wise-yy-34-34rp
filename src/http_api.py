@@ -4,7 +4,7 @@ import json
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import urlparse
 
 from .domain import (ConflictError, DomainError, NotFoundError, PermissionDenied,
                      ValidationError)
@@ -41,6 +41,14 @@ def make_handler(service: Service, static_dir: str):
 
         def _identity(self) -> Tuple[str, str]:
             return self.headers.get("X-Actor", ""), self.headers.get("X-Role", "")
+
+        def _request_id(self, body: Dict[str, Any]) -> Optional[str]:
+            rid = self.headers.get("X-Request-Id") or body.get("request_id")
+            if rid is None:
+                return None
+            if not isinstance(rid, str) or not rid.strip():
+                raise ValidationError("request_id无效")
+            return rid.strip()[:100]
 
         def _body(self) -> Dict[str, Any]:
             length = int(self.headers.get("Content-Length", "0") or 0)
@@ -81,22 +89,18 @@ def make_handler(service: Service, static_dir: str):
                 elif path == "/":
                     self._html(root / "index.html")
                 elif path == "/api/items":
-                    actor, role = self._identity()
-                    del actor
+                    _actor, role = self._identity()
                     self._json(200, {"items": service.list_items(role)})
                 elif path.startswith("/api/items/") and path.endswith("/records"):
                     item_id = int(path.split("/")[3])
-                    actor, role = self._identity()
-                    del actor
+                    _actor, role = self._identity()
                     self._json(200, {"records": service.list_records(item_id, role)})
                 elif path.startswith("/api/items/"):
                     item_id = int(path.rsplit("/", 1)[-1])
-                    actor, role = self._identity()
-                    del actor
+                    _actor, role = self._identity()
                     self._json(200, service.get_item(item_id, role))
                 elif path == "/api/audit":
-                    actor, role = self._identity()
-                    del actor
+                    _actor, role = self._identity()
                     self._json(200, {"events": service.audit(role)})
                 else:
                     self._json(404, {"error": "not_found"})
@@ -108,17 +112,33 @@ def make_handler(service: Service, static_dir: str):
                 path = urlparse(self.path).path
                 actor, role = self._identity()
                 body = self._body()
+                request_id = self._request_id(body)
+                parts = [p for p in path.split("/") if p]
                 if path == "/api/items":
-                    self._json(201, service.create_item(body, actor, role))
-                elif path.startswith("/api/items/") and path.endswith("/records"):
-                    item_id = int(path.split("/")[3])
-                    self._json(201, service.add_record(item_id, body, actor, role))
-                elif path.startswith("/api/items/") and path.endswith("/transition"):
-                    item_id = int(path.split("/")[3])
+                    self._json(201, service.create_item(body, actor, role, request_id))
+                elif len(parts) == 4 and parts[0] == "api" and parts[1] == "items" \
+                        and parts[3] == "records":
+                    item_id = int(parts[2])
+                    self._json(201, service.add_record(item_id, body, actor, role, request_id))
+                elif len(parts) == 6 and parts[0] == "api" and parts[1] == "items" \
+                        and parts[3] == "records" and parts[5] == "close":
+                    item_id = int(parts[2])
+                    record_id = int(parts[4])
+                    self._json(200, service.close_record(
+                        item_id, record_id, body, actor, role, request_id))
+                elif len(parts) == 6 and parts[0] == "api" and parts[1] == "items" \
+                        and parts[3] == "records" and parts[5] == "verify":
+                    item_id = int(parts[2])
+                    record_id = int(parts[4])
+                    self._json(200, service.verify_record(
+                        item_id, record_id, body, actor, role, request_id))
+                elif len(parts) == 4 and parts[0] == "api" and parts[1] == "items" \
+                        and parts[3] == "transition":
+                    item_id = int(parts[2])
                     target = body.get("target")
                     expected = body.get("expected_version")
                     self._json(200, service.transition(
-                        item_id, target, expected, actor, role))
+                        item_id, target, expected, actor, role, request_id))
                 else:
                     self._json(404, {"error": "not_found"})
             except Exception as exc:
